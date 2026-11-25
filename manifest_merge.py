@@ -301,6 +301,14 @@ def merge(major_dir, minor_dir, target, log):
     mapp = mroot.find("application")
     napp = nroot.find("application")
 
+    # Force native libraries to be EXTRACTED at install instead of mmapped from
+    # inside the APK. apktool's rebuild re-aligns .so to 4 KB, but Android 15+
+    # (16 KB-page devices) rejects installing an app that loads unextracted libs
+    # at the wrong alignment. Extracting sidesteps the in-APK alignment check.
+    if mapp is not None:
+        mapp.set(f"{A}extractNativeLibs", "true")
+        log("[manifest] set extractNativeLibs=true (16 KB-page install fix)")
+
     # 1. top-level permissions / features (dedupe by android:name)
     have = {e.get(f"{A}name") for e in mroot if e.tag in TOP_TAGS}
     added = 0
