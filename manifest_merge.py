@@ -216,21 +216,29 @@ _METHOD_RE = re.compile(
 
 def detect_bootstraps(minor_dir):
     """
-    Find the minor app's OWN entry points that schedule background work — a
-    public method taking a single Context, on a class that talks to WorkManager/
-    AlarmManager/JobScheduler. These are what actually register the periodic job
-    (e.g. a Kotlin `object Scheduler { fun enable(Context) }`), as opposed to the
-    library's internal services. Returns a list of dicts ordered best-first:
-      {class, method, kind ('object'|'static'), token}
-    `token` is what to pass to merge() as the target.
+    Find the minor app's OWN entry points that kick off its background work — a
+    public method taking a single Context, callable without an instance (a static
+    method, or a method on a Kotlin `object` singleton). These register the
+    periodic job (e.g. `object LocationScheduler { fun enable(Context) }`), unlike
+    the library's internal services.
+
+    We DON'T require the WorkManager reference to be in the same .smali file: in
+    Kotlin the real enqueue is often compiled into a separate helper/lambda class,
+    so the scheduler's own file may only reference it indirectly. Instead we key
+    off scheduler-style method NAMES on the app's own classes, and use an
+    app-wide "uses a background scheduler" check only to rank.
+
+    Returns dicts ordered best-first:
+      {class, method, kind ('object'|'static'), token, label}
     """
     root = ET.parse(os.path.join(minor_dir, "AndroidManifest.xml")).getroot()
     pkg = _pkg(root)
     if not pkg:
         return []
     pkg_path = pkg.replace(".", "/")
-    sched_markers = ("Landroidx/work/", "enqueue", "PeriodicWork",
-                     "Landroid/app/AlarmManager;", "Landroid/app/job/")
+    markers = ("Landroidx/work/", "enqueue", "PeriodicWork",
+               "Landroid/app/AlarmManager;", "Landroid/app/job/")
+
     cands = []
     for d in os.listdir(minor_dir):
         if not d.startswith("smali"):
@@ -242,39 +250,39 @@ def detect_bootstraps(minor_dir):
             for f in files:
                 if not f.endswith(".smali"):
                     continue
-                p = os.path.join(croot, f)
                 try:
-                    txt = open(p, encoding="utf-8", errors="ignore").read()
+                    txt = open(os.path.join(croot, f),
+                               encoding="utf-8", errors="ignore").read()
                 except OSError:
-                    continue
-                if not any(m in txt for m in sched_markers):
                     continue
                 m = re.search(r"\.class[^\n]*?(L[\w/$]+;)", txt)
                 if not m:
                     continue
                 cls = m.group(1)
                 fqcn = cls[1:-1].replace("/", ".")
-                is_object = f".field public static final INSTANCE:{cls}" in txt
+                is_object = f"INSTANCE:{cls}" in txt
+                file_has_marker = any(mk in txt for mk in markers)
                 for mm in _METHOD_RE.finditer(txt):
-                    flags = mm.group("flags")
-                    name = mm.group("name")
-                    if "public" not in flags or name in ("<init>",):
+                    flags, name = mm.group("flags"), mm.group("name")
+                    if "public" not in flags or name == "<init>":
                         continue
-                    static = "static" in flags
-                    if static:
+                    if "static" in flags:
                         kind = "static"
                     elif is_object:
                         kind = "object"
                     else:
-                        continue   # instance method with no singleton: can't call
-                    score = (0 if any(w in name.lower() for w in _SCHED_WORDS)
-                             else 1)
+                        continue   # instance method, no singleton -> can't call
+                    name_sched = any(w in name.lower() for w in _SCHED_WORDS)
+                    # keep only promising entry points: a scheduler-style name,
+                    # or a class that itself references a scheduler
+                    if not (name_sched or file_has_marker):
+                        continue
+                    score = 0 if name_sched else 1
                     cands.append((score, {
                         "class": fqcn, "method": name, "kind": kind,
                         "token": f"call:{fqcn}:{name}:{kind}",
                         "label": f"{fqcn}.{name}()"}))
     cands.sort(key=lambda c: c[0])
-    # de-dup by token, keep order
     seen, out = set(), []
     for _, c in cands:
         if c["token"] not in seen:
