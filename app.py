@@ -89,14 +89,17 @@ def index():
 
 @app.post("/services")
 async def services(minor: UploadFile = File(...)):
-    """Decode just the minor manifest so the UI can offer its services in a dropdown."""
+    """Decode the minor app (manifest + smali) so the UI can detect its
+    services and its own scheduling entry points for the dropdown."""
     job = os.path.join(WORK, uuid.uuid4().hex)
     os.makedirs(job)
     logs = []
     try:
         mp = os.path.join(job, "minor.apk")
         _save(minor, mp)
-        run(["apktool", "d", "-f", "-s", mp, "-o", os.path.join(job, "minor")],
+        # NOTE: full decode (no -s): the detectors need the smali code, not just
+        # the manifest, to find scheduling entry points like LocationScheduler.enable.
+        run(["apktool", "d", "-f", mp, "-o", os.path.join(job, "minor")],
             logs.append)
         mdir = os.path.join(job, "minor")
         svc = manifest_merge.list_services(mdir)
