@@ -103,37 +103,27 @@ def index():
     raise HTTPException(404, "index.html not found")
 
 
-@app.post("/stage")
-async def stage(file: UploadFile = File(...)):
-    """Receive one APK on its own and keep it, returning a token to merge with."""
-    token, _ = _stage_file(file)
+# --- Chunked upload: each APK is sent in <32 MB pieces, since Cloud Run caps a
+# single request at 32 MiB and a whole APK (or the two together) can exceed that.
+@app.post("/stage-init")
+async def stage_init():
+    token = uuid.uuid4().hex
+    d = os.path.join(STAGE_DIR, token)
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, "app.apk"), "wb").close()
     return {"token": token}
 
 
-@app.post("/services")
-async def services(minor: UploadFile = File(...)):
-    """Stage the minor app and decode it (manifest + smali) so the UI can detect
-    its services and its own scheduling entry points for the dropdown. Returns a
-    token so the same upload is reused for the merge."""
-    token, mp = _stage_file(minor)
-    tmp = os.path.join(WORK, uuid.uuid4().hex)
-    os.makedirs(tmp)
-    logs = []
-    try:
-        # NOTE: full decode (no -s): the detectors need the smali code, not just
-        # the manifest, to find scheduling entry points like LocationScheduler.enable.
-        run(["apktool", "d", "-f", mp, "-o", os.path.join(tmp, "minor")],
-            logs.append)
-        mdir = os.path.join(tmp, "minor")
-        svc = manifest_merge.list_services(mdir)
-        sched, hits = manifest_merge.detect_scheduler(mdir)
-        return {"minor_token": token, "services": svc, "scheduler": sched,
-                "hits": hits, "app_class": manifest_merge.app_class(mdir),
-                "bootstraps": manifest_merge.detect_bootstraps(mdir)}
-    except Exception as e:
-        raise HTTPException(500, f"{e}\n" + "\n".join(logs))
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+@app.post("/stage-chunk")
+async def stage_chunk(token: str = Form(...), chunk: UploadFile = File(...)):
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return JSONResponse({"ok": False, "error": "bad token"}, status_code=400)
+    path = os.path.join(STAGE_DIR, token, "app.apk")
+    if not os.path.isdir(os.path.dirname(path)):
+        return JSONResponse({"ok": False, "error": "unknown token"}, status_code=400)
+    with open(path, "ab") as f:
+        shutil.copyfileobj(chunk.file, f)
+    return {"ok": True}
 
 
 def _staged_apk(token):
@@ -141,6 +131,32 @@ def _staged_apk(token):
         return None
     p = os.path.join(STAGE_DIR, token, "app.apk")
     return p if os.path.exists(p) else None
+
+
+@app.post("/inspect")
+async def inspect(token: str = Form(...)):
+    """Decode an already-staged minor APK so the UI can detect its services and
+    scheduling entry points for the dropdown."""
+    apk = _staged_apk(token)
+    if not apk:
+        return JSONResponse({"ok": False, "error": "unknown token"}, status_code=400)
+    tmp = os.path.join(WORK, uuid.uuid4().hex)
+    os.makedirs(tmp)
+    logs = []
+    try:
+        # full decode (no -s): detectors need the smali code, not just the manifest.
+        run(["apktool", "d", "-f", apk, "-o", os.path.join(tmp, "minor")],
+            logs.append)
+        mdir = os.path.join(tmp, "minor")
+        sched, hits = manifest_merge.detect_scheduler(mdir)
+        return {"services": manifest_merge.list_services(mdir), "scheduler": sched,
+                "app_class": manifest_merge.app_class(mdir),
+                "bootstraps": manifest_merge.detect_bootstraps(mdir)}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{e}\n" + "\n".join(logs)},
+                            status_code=500)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.post("/merge")

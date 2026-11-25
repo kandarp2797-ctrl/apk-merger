@@ -85,39 +85,51 @@ window.majorToken=null; window.minorToken=null;
 window.majorReady=false; window.minorReady=false;
 const human=b=> b>1048576 ? (b/1048576).toFixed(1)+' MB' : Math.round(b/1024)+' KB';
 
-function upload(file,url,field,which){
+// Send the file in <32 MB chunks (Cloud Run rejects any single request over
+// 32 MiB), reassembled server-side. Works for an APK of any size.
+const CHUNK=20*1024*1024;
+async function uploadChunked(file,which){
   const prog=$(which+'Prog'), bar=prog.querySelector('.ubar'), stat=$(which+'Stat');
   window[which+'Ready']=false; checkReady();
   prog.classList.add('show'); bar.classList.remove('done'); bar.style.width='0';
   stat.className='hint ustat'; stat.textContent='Uploading '+human(file.size)+'…';
-  return new Promise((resolve,reject)=>{
-    const xhr=new XMLHttpRequest(); xhr.open('POST',url);
-    xhr.upload.onprogress=e=>{ if(e.lengthComputable){ const p=Math.round(e.loaded/e.total*100); bar.style.width=p+'%'; stat.textContent='Uploading… '+p+'%'; } };
-    xhr.onload=()=>{
-      if(xhr.status>=200&&xhr.status<300){ bar.style.width='100%'; bar.classList.add('done');
-        stat.innerHTML='<span class="ok">✓ Uploaded</span>';
-        try{ resolve(JSON.parse(xhr.responseText)); }catch(_){ resolve({}); } }
-      else{ stat.innerHTML='<span class="err">✗ Upload failed'+(xhr.status===413?' — this file is over Cloud Run’s 32 MB limit':' ('+xhr.status+')')+'</span>'; reject(new Error('status '+xhr.status)); }
-    };
-    xhr.onerror=()=>{ stat.innerHTML='<span class="err">✗ Upload failed (network)</span>'; reject(new Error('network')); };
-    const fd=new FormData(); fd.append(field,file); xhr.send(fd);
-  });
+  try{
+    const token=(await (await fetch('/stage-init',{method:'POST'})).json()).token;
+    const total=Math.ceil(file.size/CHUNK)||1;
+    for(let i=0;i<total;i++){
+      const blob=file.slice(i*CHUNK, Math.min(file.size,(i+1)*CHUNK));
+      await new Promise((resolve,reject)=>{
+        const xhr=new XMLHttpRequest(); xhr.open('POST','/stage-chunk');
+        xhr.upload.onprogress=e=>{ if(e.lengthComputable){ const p=Math.round((i*CHUNK+e.loaded)/file.size*100); bar.style.width=p+'%'; stat.textContent='Uploading… '+p+'%'; } };
+        xhr.onload=()=> (xhr.status>=200&&xhr.status<300)?resolve():reject(new Error('status '+xhr.status));
+        xhr.onerror=()=>reject(new Error('network'));
+        const fd=new FormData(); fd.append('token',token); fd.append('chunk',blob,'chunk'); xhr.send(fd);
+      });
+    }
+    bar.style.width='100%'; bar.classList.add('done'); stat.innerHTML='<span class="ok">✓ Uploaded</span>';
+    return token;
+  }catch(e){
+    stat.innerHTML='<span class="err">✗ Upload failed ('+e.message+')</span>'; throw e;
+  }
 }
 
 bindDrop('dropMajor','major', async file=>{
   window.majorToken=null;
-  try{ const j=await upload(file,'/stage','file','major'); window.majorToken=j.token; window.majorReady=!!j.token; }
+  try{ window.majorToken=await uploadChunked(file,'major'); window.majorReady=true; }
   catch(e){ window.majorReady=false; }
   checkReady();
 });
 bindDrop('dropMinor','minor', async file=>{
-  // stage the minor app AND ask the server which entry points it has
+  // upload the minor app in chunks, then ask the server which entry points it has
   window.minorToken=null;
-  let j;
-  try{ j=await upload(file,'/services','minor','minor'); }
+  let token;
+  try{ token=await uploadChunked(file,'minor'); }
   catch(e){ window.minorReady=false; checkReady(); return; }
-  window.minorToken=j.minor_token; window.minorReady=!!j.minor_token; checkReady();
+  window.minorToken=token; window.minorReady=true; checkReady();
   try{
+    const fd=new FormData(); fd.append('token',token);
+    const r=await fetch('/inspect',{method:'POST',body:fd});
+    const j=await r.json();
     const sel=$('service'); sel.innerHTML='';
     const boots=j.bootstraps||[];
     boots.forEach(b=>{const o=document.createElement('option');o.value=b.token;
