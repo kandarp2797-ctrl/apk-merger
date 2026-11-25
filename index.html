@@ -44,9 +44,9 @@
     <div class="drop" id="dropMinor"><span>Click or drop the minor .apk here</span></div>
     <input type="file" id="minor" accept=".apk">
     <div id="svcBox" style="display:none;margin-top:14px">
-      <label>Background service to auto-start</label>
+      <label>What to trigger on launch</label>
       <select id="service"></select>
-      <div class="hint">Picked from the minor app automatically. Leave as-is unless you know which one does the work.</div>
+      <div class="hint">Auto-detected. An entry point marked “schedules the work” is usually the right choice for apps that use WorkManager.</div>
       <div class="hint" id="schedHint" style="margin-top:8px"></div>
     </div>
   </div>
@@ -78,8 +78,12 @@ bindDrop('dropMinor','minor', async file=>{
     const r=await fetch('/services',{method:'POST',body:fd});
     const j=await r.json();
     const sel=$('service'); sel.innerHTML='';
-    if(j.services && j.services.length){
-      j.services.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o);});
+    const boots=j.bootstraps||[];
+    boots.forEach(b=>{const o=document.createElement('option');o.value=b.token;
+      o.textContent=b.label+'  — schedules the work';sel.appendChild(o);});
+    (j.services||[]).forEach(s=>{const o=document.createElement('option');o.value=s;
+      o.textContent=s+'  (service)';sel.appendChild(o);});
+    if(boots.length || (j.services&&j.services.length)){
       $('svcBox').style.display='block';
     } else { $('svcBox').style.display='none'; }
     const sh=$('schedHint');
