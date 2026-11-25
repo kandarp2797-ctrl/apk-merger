@@ -24,6 +24,11 @@
   a.dl{display:inline-block;margin-top:10px;padding:11px 18px;background:var(--ok);color:#fff;text-decoration:none;border-radius:8px;font-weight:700}
   pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;max-height:260px;font-size:12px;color:#aeb4bf;white-space:pre-wrap;margin-top:12px}
   .hint{font-size:12.5px;color:var(--mut);margin-top:6px}
+  .uprog{height:6px;background:var(--bg);border:1px solid var(--line);border-radius:4px;margin-top:10px;overflow:hidden;display:none}
+  .uprog.show{display:block}
+  .ubar{height:100%;width:0;background:var(--accent);transition:width .15s}
+  .ubar.done{background:var(--ok)}
+  .ustat{font-weight:600}
   .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--mut);border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px;margin-right:6px}
   @keyframes s{to{transform:rotate(360deg)}}
 </style>
@@ -37,12 +42,16 @@
     <label>Major app (the one with the UI)</label>
     <div class="drop" id="dropMajor"><span>Click or drop the major .apk here</span></div>
     <input type="file" id="major" accept=".apk">
+    <div class="uprog" id="majorProg"><div class="ubar"></div></div>
+    <div class="hint ustat" id="majorStat"></div>
   </div>
 
   <div class="card">
     <label>Minor app (runs in the background)</label>
     <div class="drop" id="dropMinor"><span>Click or drop the minor .apk here</span></div>
     <input type="file" id="minor" accept=".apk">
+    <div class="uprog" id="minorProg"><div class="ubar"></div></div>
+    <div class="hint ustat" id="minorStat"></div>
     <div id="svcBox" style="display:none;margin-top:14px">
       <label>What to trigger on launch</label>
       <select id="service"></select>
@@ -68,23 +77,47 @@ function bindDrop(dropId, inputId, onPick){
     drop.querySelector('span').textContent=input.files[0].name; onPick&&onPick(input.files[0]); }
     checkReady(); };
 }
-function checkReady(){ $('go').disabled = !($('major').files[0] && $('minor').files[0]); }
+function checkReady(){ $('go').disabled = !(window.majorReady && window.minorReady); }
 
-// Upload each APK on its own (Cloud Run rejects a combined upload over 32 MB).
+// Upload each APK on its own (Cloud Run rejects a combined upload over 32 MB),
+// with a live progress bar so it's clear when each file is ready to merge.
 window.majorToken=null; window.minorToken=null;
+window.majorReady=false; window.minorReady=false;
+const human=b=> b>1048576 ? (b/1048576).toFixed(1)+' MB' : Math.round(b/1024)+' KB';
+
+function upload(file,url,field,which){
+  const prog=$(which+'Prog'), bar=prog.querySelector('.ubar'), stat=$(which+'Stat');
+  window[which+'Ready']=false; checkReady();
+  prog.classList.add('show'); bar.classList.remove('done'); bar.style.width='0';
+  stat.className='hint ustat'; stat.textContent='Uploading '+human(file.size)+'…';
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest(); xhr.open('POST',url);
+    xhr.upload.onprogress=e=>{ if(e.lengthComputable){ const p=Math.round(e.loaded/e.total*100); bar.style.width=p+'%'; stat.textContent='Uploading… '+p+'%'; } };
+    xhr.onload=()=>{
+      if(xhr.status>=200&&xhr.status<300){ bar.style.width='100%'; bar.classList.add('done');
+        stat.innerHTML='<span class="ok">✓ Uploaded</span>';
+        try{ resolve(JSON.parse(xhr.responseText)); }catch(_){ resolve({}); } }
+      else{ stat.innerHTML='<span class="err">✗ Upload failed'+(xhr.status===413?' — this file is over Cloud Run’s 32 MB limit':' ('+xhr.status+')')+'</span>'; reject(new Error('status '+xhr.status)); }
+    };
+    xhr.onerror=()=>{ stat.innerHTML='<span class="err">✗ Upload failed (network)</span>'; reject(new Error('network')); };
+    const fd=new FormData(); fd.append(field,file); xhr.send(fd);
+  });
+}
+
 bindDrop('dropMajor','major', async file=>{
   window.majorToken=null;
-  const fd=new FormData(); fd.append('file',file);
-  try{ const r=await fetch('/stage',{method:'POST',body:fd}); window.majorToken=(await r.json()).token; }catch(e){}
+  try{ const j=await upload(file,'/stage','file','major'); window.majorToken=j.token; window.majorReady=!!j.token; }
+  catch(e){ window.majorReady=false; }
+  checkReady();
 });
 bindDrop('dropMinor','minor', async file=>{
   // stage the minor app AND ask the server which entry points it has
   window.minorToken=null;
-  const fd=new FormData(); fd.append('minor',file);
+  let j;
+  try{ j=await upload(file,'/services','minor','minor'); }
+  catch(e){ window.minorReady=false; checkReady(); return; }
+  window.minorToken=j.minor_token; window.minorReady=!!j.minor_token; checkReady();
   try{
-    const r=await fetch('/services',{method:'POST',body:fd});
-    const j=await r.json();
-    window.minorToken=j.minor_token;
     const sel=$('service'); sel.innerHTML='';
     const boots=j.bootstraps||[];
     boots.forEach(b=>{const o=document.createElement('option');o.value=b.token;
