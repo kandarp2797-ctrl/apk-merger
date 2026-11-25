@@ -23,7 +23,8 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import (HTMLResponse, FileResponse, JSONResponse,
+                               StreamingResponse)
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import merge_core
@@ -230,8 +231,21 @@ def download(token: str):
     path = os.path.join(WORK, token, "merged.apk")
     if not os.path.exists(path):
         raise HTTPException(404, "not found")
-    return FileResponse(path, filename="merged.apk",
-                        media_type="application/vnd.android.package-archive")
+
+    # Stream in chunks with NO Content-Length so the response uses chunked
+    # transfer encoding. Cloud Run caps a *buffered* response at 32 MiB, but a
+    # streamed one is unbounded — and a merged APK is usually over 32 MiB.
+    def gen():
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(1024 * 1024)
+                if not b:
+                    break
+                yield b
+
+    return StreamingResponse(
+        gen(), media_type="application/vnd.android.package-archive",
+        headers={"Content-Disposition": 'attachment; filename="merged.apk"'})
 
 
 if __name__ == "__main__":
