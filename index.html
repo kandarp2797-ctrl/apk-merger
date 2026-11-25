@@ -70,13 +70,21 @@ function bindDrop(dropId, inputId, onPick){
 }
 function checkReady(){ $('go').disabled = !($('major').files[0] && $('minor').files[0]); }
 
-bindDrop('dropMajor','major');
+// Upload each APK on its own (Cloud Run rejects a combined upload over 32 MB).
+window.majorToken=null; window.minorToken=null;
+bindDrop('dropMajor','major', async file=>{
+  window.majorToken=null;
+  const fd=new FormData(); fd.append('file',file);
+  try{ const r=await fetch('/stage',{method:'POST',body:fd}); window.majorToken=(await r.json()).token; }catch(e){}
+});
 bindDrop('dropMinor','minor', async file=>{
-  // ask the server which services the minor app declares
+  // stage the minor app AND ask the server which entry points it has
+  window.minorToken=null;
   const fd=new FormData(); fd.append('minor',file);
   try{
     const r=await fetch('/services',{method:'POST',body:fd});
     const j=await r.json();
+    window.minorToken=j.minor_token;
     const sel=$('service'); sel.innerHTML='';
     const boots=j.bootstraps||[];
     boots.forEach(b=>{const o=document.createElement('option');o.value=b.token;
@@ -100,9 +108,13 @@ $('go').onclick=async()=>{
   $('go').disabled=true;
   $('status').innerHTML='<span class="spin"></span>Merging — decompiling, merging, rebuilding and signing. This can take a minute or two…';
   $('log').style.display='none';
+  if(!window.majorToken || !window.minorToken){
+    $('status').innerHTML='<span class="err">✗ Files are still uploading — wait a moment and try again.</span>';
+    $('go').disabled=false; return;
+  }
   const fd=new FormData();
-  fd.append('major',$('major').files[0]);
-  fd.append('minor',$('minor').files[0]);
+  fd.append('major_token',window.majorToken);
+  fd.append('minor_token',window.minorToken);
   fd.append('service',$('service').value||'');
   try{
     const r=await fetch('/merge',{method:'POST',body:fd});

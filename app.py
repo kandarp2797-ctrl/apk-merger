@@ -43,11 +43,27 @@ def auth(creds: HTTPBasicCredentials = Depends(_basic)):
                             headers={"WWW-Authenticate": "Basic"})
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-WORK = os.path.join(APP_DIR, "jobs")
-KEYSTORE = os.path.join(APP_DIR, "merge.keystore")
+# Write under a guaranteed-writable temp dir: some hosts (e.g. Hugging Face
+# Spaces) run the container as a non-root user without write access to /app.
+_BASE = os.path.join(tempfile.gettempdir(), "apkmerge")
+WORK = os.path.join(_BASE, "jobs")
+# Each APK is uploaded on its own (Cloud Run caps a single request at 32 MiB, so
+# the two apps can't be sent together). Staged files live here, keyed by token.
+STAGE_DIR = os.path.join(_BASE, "stage")
+KEYSTORE = os.path.join(_BASE, "merge.keystore")
 KS_PASS = "merger123"
 KS_ALIAS = "mergerkey"
 os.makedirs(WORK, exist_ok=True)
+os.makedirs(STAGE_DIR, exist_ok=True)
+
+
+def _stage_file(upload):
+    token = uuid.uuid4().hex
+    d = os.path.join(STAGE_DIR, token)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "app.apk")
+    _save(upload, path)
+    return token, path
 
 app = FastAPI(title="APK Merger", dependencies=[Depends(auth)])
 
@@ -87,46 +103,61 @@ def index():
     raise HTTPException(404, "index.html not found")
 
 
+@app.post("/stage")
+async def stage(file: UploadFile = File(...)):
+    """Receive one APK on its own and keep it, returning a token to merge with."""
+    token, _ = _stage_file(file)
+    return {"token": token}
+
+
 @app.post("/services")
 async def services(minor: UploadFile = File(...)):
-    """Decode the minor app (manifest + smali) so the UI can detect its
-    services and its own scheduling entry points for the dropdown."""
-    job = os.path.join(WORK, uuid.uuid4().hex)
-    os.makedirs(job)
+    """Stage the minor app and decode it (manifest + smali) so the UI can detect
+    its services and its own scheduling entry points for the dropdown. Returns a
+    token so the same upload is reused for the merge."""
+    token, mp = _stage_file(minor)
+    tmp = os.path.join(WORK, uuid.uuid4().hex)
+    os.makedirs(tmp)
     logs = []
     try:
-        mp = os.path.join(job, "minor.apk")
-        _save(minor, mp)
         # NOTE: full decode (no -s): the detectors need the smali code, not just
         # the manifest, to find scheduling entry points like LocationScheduler.enable.
-        run(["apktool", "d", "-f", mp, "-o", os.path.join(job, "minor")],
+        run(["apktool", "d", "-f", mp, "-o", os.path.join(tmp, "minor")],
             logs.append)
-        mdir = os.path.join(job, "minor")
+        mdir = os.path.join(tmp, "minor")
         svc = manifest_merge.list_services(mdir)
         sched, hits = manifest_merge.detect_scheduler(mdir)
-        return {"services": svc, "scheduler": sched, "hits": hits,
-                "app_class": manifest_merge.app_class(mdir),
+        return {"minor_token": token, "services": svc, "scheduler": sched,
+                "hits": hits, "app_class": manifest_merge.app_class(mdir),
                 "bootstraps": manifest_merge.detect_bootstraps(mdir)}
     except Exception as e:
         raise HTTPException(500, f"{e}\n" + "\n".join(logs))
     finally:
-        shutil.rmtree(job, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _staged_apk(token):
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return None
+    p = os.path.join(STAGE_DIR, token, "app.apk")
+    return p if os.path.exists(p) else None
 
 
 @app.post("/merge")
-async def merge(major: UploadFile = File(...),
-                minor: UploadFile = File(...),
+async def merge(major_token: str = Form(...),
+                minor_token: str = Form(...),
                 service: str = Form("")):
+    major_apk = _staged_apk(major_token)
+    minor_apk = _staged_apk(minor_token)
+    if not (major_apk and minor_apk):
+        return JSONResponse(
+            {"ok": False, "error": "Uploaded APKs weren't found on the server — "
+             "re-select both files and try again."}, status_code=400)
     job = os.path.join(WORK, uuid.uuid4().hex)
     os.makedirs(job)
     logs = []
     log = logs.append
     try:
-        major_apk = os.path.join(job, "major.apk")
-        minor_apk = os.path.join(job, "minor.apk")
-        _save(major, major_apk)
-        _save(minor, minor_apk)
-
         major_dir = os.path.join(job, "major")
         minor_dir = os.path.join(job, "minor")
         run(["apktool", "d", "-f", major_apk, "-o", major_dir], log)
